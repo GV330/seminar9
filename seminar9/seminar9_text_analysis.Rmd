@@ -1,0 +1,707 @@
+---
+title: "Seminar Week 9: Text as Data"
+author: "Melissa Sands"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+---
+
+# Introduction
+
+Today we will walk through the following:
+
+1. **Corpus construction and the DFM** — the foundational step; preprocessing choices have downstream consequences
+2. **Word frequencies and word clouds** — useful for exploration, insufficient for inference
+3. **Dictionary-based sentiment** — replicable and interpretable, but context-blind; dictionary choice matters
+4. **Transformer-based sentiment** — context-sensitive but computationally expensive and less transparent
+5. **STM** — unsupervised topic discovery with covariate integration and hypothesis testing
+
+Our primary dataset is a collection of UK Green Party press releases scraped from the party website (https://greenparty.org.uk/category/press/). We also have a sample of Reddit posts from r/ukpolitics (https://www.reddit.com/r/ukpolitics/) and a set of UK House of Commons oral questions (https://explore.data.parliament.uk/?endpoint=commonsoralquestions#download-list) — these appear as secondary examples and exercises.
+
+---
+
+# 0. Setup
+
+Before we begin, we load all required packages. The code block below checks whether each package is installed and installs it if not, then loads it. You've seen this before. 
+
+> **Note on `quanteda.sentiment`:** This package is not available on CRAN. It must be installed from GitHub using `remotes`. The chunk below handles this automatically the first time you run it.
+
+> **Note on Python-dependent package (`transforEmotion`):** Section 4 uses packages that call Python under the hood via `reticulate`. Code chunks in that sections are set to `eval=FALSE` — you do not need to run them during the seminar (this is your warning that they make take some time to run!), but we will walk through the code together. See the notes in the relevant section for setup instructions.
+
+```{r install-and-load, message=FALSE, warning=FALSE}
+# ── CRAN packages ─────────────────────────────────────────────────────────────
+cran_packages <- c(
+  "tidyverse",
+  "quanteda",
+  "quanteda.textstats",
+  "quanteda.textplots",
+  "wordcloud2",
+  "stm",
+  "remotes",
+  "ggplot2",
+  "dplyr",
+  "lubridate",
+  "tm",
+  "SnowballC"
+)
+
+installed_cran <- rownames(installed.packages())
+to_install     <- setdiff(cran_packages, installed_cran)
+
+if (length(to_install) > 0) {
+  install.packages(to_install, dependencies = TRUE)
+}
+
+invisible(lapply(cran_packages, library, character.only = TRUE))
+
+# ── GitHub packages ───────────────────────────────────────────────────────────
+# quanteda.sentiment is not on CRAN; install from the quanteda GitHub org
+if (!requireNamespace("quanteda.sentiment", quietly = TRUE)) {
+  remotes::install_github("quanteda/quanteda.sentiment")
+}
+library(quanteda.sentiment)
+
+# ── Python-dependent packages (install separately if needed) ──────────────────
+# transforEmotion and BERTopic are loaded only in their respective sections
+# (eval=FALSE chunks). We do NOT auto-install them here.
+```
+
+```{r load-data, message=FALSE, warning=FALSE}
+# ── Load data ─────────────────────────────────────────────────────────────────
+# All paths are relative to the Rmd file location
+
+green <- read.csv("data/uk_green_party_press_releases.csv",
+                  stringsAsFactors = FALSE)
+
+reddit <- read.csv("data/reddit_climate_change_2022_sample.csv",
+                   stringsAsFactors = FALSE)
+
+commons <- read.csv("data/commons_oral_questions.csv",
+                    stringsAsFactors = FALSE)
+
+# How many documents does each contain?
+cat("Green Party press releases: ", nrow(green),  " documents\n", sep = "")
+cat("Reddit climate posts:       ", nrow(reddit), " documents\n", sep = "")
+cat("Commons oral questions:     ", nrow(commons)," documents\n", sep = "")
+```
+
+```{r preview-data}
+# Glimpse at the primary dataset
+dplyr::glimpse(green)
+```
+
+The Green Party dataset contains `r nrow(green)` press releases with columns for the title, publication date, full text, URL, party, country, year, and a ParlGov (https://www.parlgov.org/) party ID (467 = Green Party)
+
+---
+
+# 1. From Documents to Data
+
+## 1.1 Corpora and the Document-Feature Matrix
+
+In the lecture we established the foundational vocabulary of text-as-data. A **document** is any discrete unit of text — a tweet, a press release, a speech. A **corpus** is typically principled collection of documents that shares some common rationale (same author, same time period, same genre, etc.). 
+
+Once you have a corpus, the most common representation is the **document-feature matrix (DFM)** — also called a term-document matrix (TDM) in the wider literature, though the two are technically transposes of each other: a TDM has terms as rows and documents as columns, while a DFM (or DTM) has documents as rows and terms (features) as columns. `quanteda` uses the DFM convention. Each cell records how often a word appears in a document. This is the **bag-of-words** assumption: we throw away word order and retain only counts.
+
+As we saw in the lecture, this assumption is enormously useful but also a real limitation. "The dog bit the man" and "The man bit the dog" have identical TDMs even though they describe very different events.
+
+Let us build this step by step.
+
+```{r create-corpus}
+# Step 1: Create the corpus
+# text_field tells quanteda which column contains the document text.
+# All other columns become document-level metadata (docvars).
+corp <- corpus(green, text_field = "text")
+
+# A corpus summary shows us the first few documents and their metadata
+summary(corp, n = 5)
+```
+
+The `summary()` output shows each document's token count (Types, Tokens, Sentences) alongside its metadata. `Text` is the document name. `Sentences` is the number of sentences in the document. `Tokens` is the number of tokens in the text and `Types` is the number of unique tokens in the text. 
+
+Notice the variation in document length — a challenge we will return to when interpreting raw frequency counts.
+
+## 1.2 Preprocessing: Tokenisation and the DFM
+
+Raw text is noisy. Before building the DFM, we apply a sequence of **preprocessing** steps. Recall from lecture: *there is no single correct set of preprocessing steps* — the appropriate choices depend on the downstream task.
+
+Here is a typical pipeline for topic modelling or frequency analysis:
+
+```{r build-dfm}
+# Step 2: Tokenise — split each document into individual word tokens
+toks <- tokens(corp,
+               remove_punct   = TRUE,   # strip punctuation
+               remove_numbers = TRUE,   # strip standalone numbers
+               remove_symbols = TRUE)   # strip currency symbols, etc.
+
+# Step 3: Lowercase — so "Climate" and "climate" are the same feature
+toks <- tokens_tolower(toks)
+
+# Step 4: Remove stopwords — high-frequency function words add noise
+# quanteda ships with stopword lists for many languages
+toks <- tokens_remove(toks, stopwords("en"))
+
+# Step 5: Stem — reduce words to their root form
+# "climate", "climates", "climatic" → "climat"
+# Remember: stemming is fast but crude. For most topic-modelling tasks it works
+# well. For sentiment analysis it can hurt (see Section 3).
+toks <- tokens_wordstem(toks)
+
+# Step 6: Build the DFM
+dfmat <- dfm(toks)
+
+dfmat
+```
+
+```{r dfm-slice}
+# Inspect a small slice: first 6 documents, most frequent 10 features
+dfmat[1:6, names(topfeatures(dfmat, 10))] |> as.matrix()
+```
+
+A few things to remember about DFMs:
+
+1. **Sparsity**: most cells contain zero. A typical political text DFM is 90–99% zeros — most words do not appear in any given document. This is normal and expected.
+2. **Feature count**: even after preprocessing we have thousands of columns. Many are rare technical or proper-noun terms that appear in only one or two documents.
+3. **Preprocessing effects**: stemming has collapsed related word forms. "party", "parties", all map to "parti".
+
+> The DFM is the entry point for nearly all bag-of-words methods — word frequencies, TF-IDF weighting, topic models, and some classifiers. Getting the preprocessing right for your task is as important as choosing the right model.
+
+## Optional Exercise 1
+
+Try building a DFM from the Reddit climate data. Does it make sense to use the same preprocessing steps? What is different about Reddit text compared to party press releases?
+
+```{r exercise-1, eval=FALSE}
+
+reddit_corp  <- corpus(reddit, text_field = "text")
+reddit_toks  <- tokens(reddit_corp, remove_punct = TRUE, remove_numbers = TRUE) |>
+  tokens_tolower() |>
+  tokens_remove(stopwords("en")) |>
+  tokens_wordstem()
+reddit_dfmat <- dfm(reddit_toks)
+reddit_dfmat
+```
+
+---
+
+# 2. Word Frequencies and Word Clouds
+
+## 2.1 Top Features
+
+The simplest form of text analysis is counting. The `topfeatures()` function returns the most frequent terms across the corpus.
+
+```{r top-features}
+# Top 20 most frequent stems in the Green Party corpus
+top20 <- topfeatures(dfmat, n = 20)
+top20
+```
+
+```{r top-features-plot, fig.width=8, fig.height=5}
+# Visualise as a bar chart
+top20_df <- data.frame(
+  term  = names(top20),
+  count = as.integer(top20)
+)
+
+ggplot(top20_df, aes(x = reorder(term, count), y = count)) +
+  geom_col(fill = "#2e8b57", alpha = 0.85) +
+  coord_flip() +
+  labs(
+    title    = "Top 20 Terms in Green Party Press Releases",
+    subtitle = "After stopword removal and stemming",
+    x        = NULL,
+    y        = "Frequency"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+The dominance of "green" is unsurprising — the party name appears in almost every press release. Terms like "parti", "govern", and "labour" give us a first impression of thematic content: electoral competition and government critique. However, many of the other high-frequency stems — "chris", "william", "po", "box", "promot" — are artefacts of a standard boilerplate footer appended to every press release: *"Promoted by Chris Williams on behalf of The Green Party, both at PO Box 78066, London, SE16 9GQ"*. This is a good reminder to always read your corpus before drawing conclusions from frequency counts.
+
+## 2.2 Cleaning Boilerplate and Replotting
+
+We strip the footer with a regex anchored to the phrase "Promoted by", removing everything from that point to the end of each document.
+
+```{r clean-boilerplate, fig.width=8, fig.height=5}
+# Remove the standard promotional footer from each press release.
+# The pattern catches variations (different names, addresses) by matching
+# everything from "Promoted by" to the end of the string.
+green_clean <- green |>
+  dplyr::mutate(
+    text = stringr::str_remove(
+      text,
+      stringr::regex("\\s*promoted by .+", dotall = TRUE, ignore_case = TRUE)
+    )
+  )
+
+# Rebuild corpus, tokens, and DFM on the cleaned text
+corp_clean  <- corpus(green_clean, text_field = "text")
+toks_clean  <- tokens(corp_clean,
+                      remove_punct   = TRUE,
+                      remove_numbers = TRUE,
+                      remove_symbols = TRUE) |>
+  tokens_tolower() |>
+  tokens_remove(stopwords("en")) |>
+  tokens_wordstem()
+dfmat_clean <- dfm(toks_clean)
+
+# Plot top 20 terms in the cleaned DFM
+top20_clean    <- topfeatures(dfmat_clean, n = 20)
+top20_clean_df <- data.frame(
+  term  = names(top20_clean),
+  count = as.integer(top20_clean)
+)
+
+ggplot(top20_clean_df, aes(x = reorder(term, count), y = count)) +
+  geom_col(fill = "#2e8b57", alpha = 0.85) +
+  coord_flip() +
+  labs(
+    title    = "Top 20 Terms After Removing Boilerplate Footer",
+    subtitle = "Promotional footer stripped before preprocessing",
+    x        = NULL,
+    y        = "Frequency"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+The boilerplate stems have disappeared and the remaining top terms are more substantively meaningful. We will use `dfmat_clean` for the word cloud below, and recommend using `green_clean` as the basis for any further analysis.
+
+## 2.3 Word Cloud
+
+```{r wordcloud, fig.width=7, fig.height=7}
+# quanteda.textplots integrates directly with DFM objects
+# max_words controls clutter; color adds visual hierarchy
+set.seed(02138)
+textplot_wordcloud(dfmat_clean,
+                   max_words    = 100,
+                   color        = c("#cce5cc", "#66b266", "#2e8b57", "#1a5c1a"),
+                   min_size     = 0.5,
+                   max_size     = 4)
+```
+
+
+---
+
+# 3. Dictionary-Based Sentiment Analysis
+
+## 3.1 How Dictionary Methods Work
+
+A **dictionary method** assigns a sentiment score to a document by matching its words against a pre-compiled list of (for example) positive and negative words. If a document contains many positive words and few negative ones, it receives a high (positive) score, and vice versa.
+
+As we saw in lecture, dictionary methods have advantages: they are low-cost, replicable, and require no training data. The key limitation is **contextual sensitivity**: dictionary methods treat each word independently, ignoring surrounding context. "The party is not doing well" and "The party is doing well" differ only by one negation, but a naive dictionary method would assign them the same score if it ignores the word "not".
+
+## 3.2 Lexicoder Sentiment Dictionary (LSD2015)
+
+The **Lexicoder Sentiment Dictionary (LSD2015)** was designed specifically for political text (Young and Soroka, 2012) and validated on political news. Unlike most general dictionaries, it includes four categories — `positive`, `negative`, `neg_positive` (negated positives, e.g. "not good"), and `neg_negative` (negated negatives, e.g. "not bad") — which `textstat_polarity()` maps correctly. It is built into `quanteda.sentiment`.
+
+```{r lsd-sentiment}
+# For sentiment analysis, we use the raw (un-stemmed) DFM because stemming can
+# damage the dictionary matching. We also preserve negation words.
+toks_sent <- tokens(corp,
+                    remove_punct   = TRUE,
+                    remove_numbers = TRUE,
+                    remove_symbols = TRUE) |>
+  tokens_tolower()
+# Note: we do NOT remove stopwords or stem here — important for sentiment!
+
+dfmat_sent <- dfm(toks_sent)
+
+# Apply the Lexicoder Sentiment Dictionary
+# textstat_polarity() is the function for polarity-type dictionaries like
+# LSD2015 and Hu & Liu, which classify words into positive/negative categories.
+# (Use textstat_valence() only for dictionaries with numeric scores per word.)
+# It returns a 'sentiment' score: positive values = more positive language.
+lsd_scores <- textstat_polarity(dfmat_sent,
+                                dictionary = data_dictionary_LSD2015)
+
+head(lsd_scores)
+```
+
+```{r lsd-over-time, fig.width=9, fig.height=5}
+# Merge sentiment scores with document metadata
+lsd_df <- lsd_scores |>
+  dplyr::left_join(
+    data.frame(doc_id = docnames(corp),
+               docvars(corp)),
+    by = "doc_id"
+  ) |>
+  dplyr::mutate(date = as.Date(date))
+
+# Plot sentiment over time over time
+ggplot(lsd_df, aes(x = date, y = sentiment)) +
+  geom_jitter(alpha = 0.35, width = 0.25, color = "#2e8b57", size = 1.2) +
+  geom_smooth(method = "loess", se = TRUE, color = "#1a5c1a", linewidth = 1.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  labs(
+    title    = "Sentiment of Green Party Press Releases Over Time",
+    subtitle = "Lexicoder Sentiment Dictionary (LSD2015); 0 = neutral",
+    x        = "Time",
+    y        = "Sentiment score"
+  ) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 3.3 A Second Dictionary: Hu & Liu
+
+To illustrate that dictionary choice matters, we compare LSD scores against the **Hu & Liu (2004)** opinion lexicon — a general-purpose positive/negative dictionary originally built from product reviews. This makes for an instructive contrast: LSD was calibrated for *political* text, while Hu & Liu was calibrated for *consumer* text. The same word (e.g., "radical", "progressive", "green") may be treated very differently by the two lexica.
+
+```{r huliu-sentiment}
+# data_dictionary_HuLiu is bundled with quanteda.sentiment
+# It contains around 2,000 positive and 4,800 negative word entries
+huliu_scores <- textstat_polarity(dfmat_sent,
+                                  dictionary = data_dictionary_HuLiu)
+
+head(huliu_scores)
+```
+
+```{r compare-dictionaries, fig.width=8, fig.height=5}
+# Merge both scores for comparison
+compare_df <- data.frame(
+  doc_id = lsd_scores$doc_id,
+  lsd    = lsd_scores$sentiment,
+  huliu  = huliu_scores$sentiment
+)
+
+# Rescale both to [−1, 1] for visual comparability
+rescale01 <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (diff(rng) == 0) return(x)
+  (x - rng[1]) / diff(rng) * 2 - 1
+}
+
+compare_df <- compare_df |>
+  dplyr::mutate(
+    lsd_scaled   = rescale01(lsd),
+    huliu_scaled = rescale01(huliu)
+  )
+
+ggplot(compare_df, aes(x = lsd_scaled, y = huliu_scaled)) +
+  geom_point(alpha = 0.4, color = "#2e8b57", size = 1.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "#1a5c1a") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    title    = "LSD2015 vs. Hu & Liu Polarity Scores",
+    subtitle = "Both rescaled to [−1, 1]. Dashed line = perfect agreement.",
+    x        = "LSD2015 — political lexicon (rescaled)",
+    y        = "Hu & Liu — general lexicon (rescaled)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+```{r correlation-dictionaries}
+cor_val <- cor(compare_df$lsd_scaled, compare_df$huliu_scaled, use = "complete.obs")
+cat("Pearson correlation between LSD and Hu & Liu:", round(cor_val, 3), "\n")
+```
+
+The correlation tells us how much the two dictionaries agree. We see relatively broad agreement, but it's far from perfect. Always validate your sentiment scores qualitatively. Pick a few high-scoring and low-scoring documents and read them. Does the score match your intuition? If two dictionaries strongly disagree, that is a signal to investigate why — and potentially to average across multiple lexica.
+
+## Optional Exercise 2
+
+Apply the LSD2015 dictionary to the Reddit climate change posts. Does the average sentiment differ across subreddits? Use `dplyr::group_by()` and `dplyr::summarise()` to find out.
+
+```{r exercise-2, eval=FALSE}
+
+reddit_corp_sent <- corpus(reddit, text_field = "text")
+reddit_toks_sent <- tokens(reddit_corp_sent,
+                           remove_punct = TRUE, remove_numbers = TRUE) |>
+  tokens_tolower()
+reddit_dfmat_sent <- dfm(reddit_toks_sent)
+
+reddit_lsd <- textstat_polarity(reddit_dfmat_sent,
+                                dictionary = data_dictionary_LSD2015)
+
+# Join back to the original dataframe to recover the subreddit column
+# (using the raw dataframe is more reliable than recovering via docvars())
+reddit_lsd_df <- reddit_lsd |>
+  dplyr::mutate(row = seq_len(dplyr::n())) |>
+  dplyr::bind_cols(reddit[seq_len(nrow(reddit_lsd)), c("subreddit.name", "date")])
+
+reddit_lsd_df |>
+  dplyr::group_by(subreddit.name) |>
+  dplyr::summarise(mean_polarity = mean(sentiment, na.rm = TRUE),
+                   n = dplyr::n()) |>
+  dplyr::arrange(dplyr::desc(mean_polarity))
+```
+
+---
+
+# 4. Modern Sentiment Analysis with Transformers
+
+> **Note:** All code chunks in this section are set to `eval=FALSE`. They will not run when you knit the document. During the seminar, we will walk through the code together. If you want to run it yourself, you will need Python installed on your machine. Run `transforEmotion::setup_modules()` once in your R console to pre-warm the Python environment, then restart R.
+
+## 4.1 The Limitation of Dictionary Methods
+
+Recall the example from lecture: *"right-wing party"* and *"the right answer"* both contain the word "right", but they have nothing to do with each other semantically. Dictionary methods cannot handle this — they assign the same value to a word regardless of context.
+
+**Transformer models** solve this problem by producing **context-sensitive word representations**. BERT (Devlin et al., 2018) reads the entire sentence bidirectionally, so the representation of each word is conditioned on all the words around it. Two occurrences of "right" in different contexts will have different vector representations.
+
+## 4.2 Zero-Shot Sentiment with `transforEmotion`
+
+The `transforEmotion` package (https://cran.r-project.org/package=transforEmotion and https://github.com/atomashevic/transforEmotion) wraps Hugging Face transformer pipelines and makes them callable from R. Here we ask the model to classify each document as "positive", "negative", or "neutral".
+
+```{r transformer-setup, eval=FALSE}
+# One-time setup — run this once in your R console, NOT during knitting
+if (!requireNamespace("transforEmotion", quietly = TRUE)) {
+  install.packages("transforEmotion")
+}
+library(transforEmotion)
+setup_modules()  # pre-warms the Python environment managed by transforEmotion
+```
+
+```{r transformer-sentiment-sample, eval=FALSE}
+library(transforEmotion)
+# Work with a manageable sample — transformer inference is slow on CPU 
+set.seed(02138)
+sample_green <- green |> dplyr::slice_sample(n = 50)
+```
+
+Below, `transformer_scores()` returns sentiment probabilities for each class that you define inside the function. See fn documentation (https://www.rdocumentation.org/packages/transforEmotion/versions/0.1.5/topics/transformer_scores) for details. The default model is a distilbert fine-tuned on SST-2 (English sentiment), but we have set it below to a BART, which in this case is a larger / slower model but highly effective at zero-shot classification. Feel free to experiment with other models! BART-MNLI returns a probability distribution over the labels we supply (positive, negative, neutral). These three scores sum to 1.0 for each document. They represent the model's confidence that the document belongs to each class.
+
+```{r transformer-results, eval=FALSE}
+transformer_results <- transformer_scores(
+  text    = sample_green$text,
+  classes = c("positive", "negative", "neutral"),
+  transformer = ("facebook-bart")
+)
+
+head(dplyr::bind_rows(transformer_results))
+```
+
+Here we build LSD scores for the same 50 documents so we can compare directly. *But* note that *the LSD score is structurally different from the transformer score*: it is a  single continuous polarity score computed as (positive_words - negative_words) / total_sentiment_words, roughly. Positive values = more positive language, negative values = more negative, zero = neutral. There is no probability interpretation.
+
+```{r transformer-compare, eval=FALSE}
+
+sample_lsd <- corpus(sample_green, text_field = "text") |>
+  tokens(remove_punct = TRUE, remove_numbers = TRUE, remove_symbols = TRUE) |>
+  tokens_tolower() |>
+  dfm() |>
+  textstat_polarity(dictionary = data_dictionary_LSD2015)
+
+# Combine transformer probabilities, LSD score, and a text snippet
+compare_df <- dplyr::bind_rows(transformer_results) |>
+  dplyr::mutate(
+    transformer_label = dplyr::case_when(
+      positive > 0.6 ~ "positive",
+      negative > 0.6 ~ "negative",
+      TRUE           ~ "neutral"
+    ),
+    lsd_score = sample_lsd$sentiment,
+    lsd_label = dplyr::case_when(
+      lsd_score >  0.05 ~ "positive",
+      lsd_score < -0.05 ~ "negative",
+      TRUE              ~ "neutral"
+    ),
+    text_snippet = substr(sample_green$text, 1, 250)
+  )
+
+# Let's look at disagreements between labels:
+compare_df |>
+  dplyr::filter(transformer_label != lsd_label) |>
+  dplyr::select(transformer_label, lsd_label, lsd_score, positive, negative, text_snippet) |>
+  print(n = Inf)
+```
+
+Look for press releases where the LSD scores a document as positive but the transformer scores it as negative (or vice versa). Often you will find that the LSD is picking up on genuinely positive or negative words, but the *frame* of the document — who is being criticised, what the party is advocating — is what the transformer captures.
+
+
+---
+
+# 5. Topic Modelling with STM
+
+## 5.1 Unsupervised Discovery of Themes
+
+In Sections 3 and 4 we used *supervised* methods: we told the model what categories to look for (positive/negative). **Topic modelling** is *unsupervised* — we ask the algorithm to discover latent themes from the text without specifying them in advance.
+
+**Latent Dirichlet Allocation (LDA)** assumes that each document is a mixture of topics and each topic is a probability distribution over words. We observe the words; the topics are latent. The model is estimated by finding the topic assignments that best explain the observed word co-occurrence patterns.
+
+The **Structural Topic Model (STM)** of Roberts et al. (2014) extends LDA in a crucial way: it allows **document-level covariates** to influence both topic prevalence (how much document $d$ discusses topic $k$) and topic content (which words topic $k$ uses in document $d$). This means we can ask: *does the Green Party talk more about housing policy in election years?* — and test it statistically. This is what the lecture slide meant by STM enabling *hypothesis testing*, not just description.
+
+## 5.2 Preprocessing for STM
+
+The `stm` package has its own preprocessing pipeline. It is similar to what we did above, but uses its own vocabulary-trimming step via `prepDocuments()`.
+
+```{r stm-preprocessing}
+set.seed(02138)
+
+# Convert date to decimal year (e.g. 2019.583 for late July 2019).
+# This gives a continuous time axis at monthly resolution, which is better
+# than integer Year when many press releases fall in the same calendar year.
+green_stm <- green_clean |>
+  dplyr::mutate(
+    date_parsed  = lubridate::ymd(date),
+    year_decimal = lubridate::decimal_date(date_parsed)
+  ) |>
+  dplyr::filter(!is.na(year_decimal))
+
+# stm::textProcessor() handles tokenisation, stopword removal, and stemming
+# It takes a character vector of documents and (optionally) a metadata dataframe
+processed <- textProcessor(
+  documents = green_stm$text,
+  metadata  = green_stm,
+  lowercase = TRUE,
+  removestopwords = TRUE,
+  removenumbers   = TRUE,
+  removepunctuation = TRUE,
+  stem = TRUE,
+  language = "english",
+  verbose = FALSE
+)
+
+# prepDocuments() removes very rare and very common terms.
+# lower.thresh: remove words appearing in fewer than X documents
+# upper.thresh: remove words appearing in more than X% of documents (optional)
+out <- prepDocuments(
+  processed$documents,
+  processed$vocab,
+  processed$meta,
+  lower.thresh = 5,   # at least 5 documents must contain the word
+  verbose = FALSE
+)
+
+docs  <- out$documents
+vocab <- out$vocab
+meta  <- out$meta
+
+cat("Vocabulary size after trimming:", length(vocab), "terms\n")
+cat("Documents retained:            ", length(docs),  "\n")
+```
+
+## 5.3 Fitting the STM
+
+We fit a model with K = 10 topics. In practice, the choice of K is a modelling decision — try a range of values and use held-out likelihood or semantic coherence scores to guide selection. We use `year_decimal` as the prevalence covariate (e.g. 2019.583 for late July 2019), which gives a continuous time axis at monthly resolution. See https://cran.r-project.org/web/packages/stm/stm.pdf for details.
+
+```{r fit-stm, results='hide'}
+# This may take a few minutes depending on your machine.
+# set.seed() ensures reproducible results.
+set.seed(02138)
+
+stm_model <- stm(
+  documents  = docs,
+  vocab      = vocab,
+  K          = 10,
+  prevalence = ~ year_decimal,  # continuous time at monthly resolution
+  data       = meta,
+  max.em.its = 75,              # maximum EM iterations (increase for final runs)
+  init.type  = "Spectral",      # anchor-word initialisation helps EM converge faster andto a better optimum
+  verbose    = FALSE
+)
+```
+
+## 5.4 Exploring the Topics
+
+```{r stm-summary, fig.width=9, fig.height=7}
+# Overview plot: top terms for each topic by four metrics
+plot(stm_model, type = "summary", n = 7,
+     main = "STM: Top Terms per Topic (Green Party Press Releases)")
+```
+
+```{r label-topics}
+# labelTopics() shows top words under four scoring criteria:
+#   Highest Prob: most probable words in the topic
+#   FREX: words that are frequent AND exclusive to this topic
+#   Lift: words more probable in this topic than in others
+#   Score: a combined metric
+labelTopics(stm_model, n = 8)
+```
+
+Examine the top words and try to give each topic a human-readable label.
+
+## 5.5 Topic Prevalence Over Time
+
+The core advantage of STM is that we can estimate how topic prevalence changes as a function of our covariate — here, `year_decimal`. The `estimateEffect()` function fits a regression of topic proportion on the covariate. The coefficient is interpreted as the change in topic proportion per year; because `year_decimal` is continuous at monthly resolution, the estimate uses the full within-year ordering rather than collapsing all documents from the same year to a single point. 
+
+```{r estimate-effect}
+# Estimate how topic proportions change over time
+effects <- estimateEffect(
+  formula     = 1:10 ~ year_decimal,
+  stmobj      = stm_model,
+  metadata    = meta,
+  uncertainty = "Global"
+)
+
+# show regression of topic proportion on year_decimal for the first 5 topics:
+summary(effects, topics = 1:5)
+```
+
+```{r plot-effects, fig.width=10, fig.height=6}
+par(mfrow = c(2, 5), mar = c(3, 2, 2, 1))
+for (k in 1:10) {
+  plot(effects, covariate = "year_decimal",
+       topics      = k,
+       model       = stm_model,
+       method      = "continuous",
+       main        = paste("Topic", k),
+       xlab        = "Year",
+       ylab        = "Proportion",
+       printlegend = FALSE)
+}
+```
+
+The plots show how much each topic's share of the corpus changes over time, along with a confidence interval. A clear upward or downward trend — ideally with a narrow CI that does not cross zero — constitutes evidence of a real temporal shift in what the Green Party talks about.
+
+> This is what distinguishes STM from a simple word cloud. We are not just saying "this word became more common over time" — we are estimating the prevalence of a coherent theme (the topic) as a function of a covariate, with uncertainty quantified. 
+
+## Optional Exercise 3
+
+Refit the STM model on the **Commons oral questions** dataset. Use `answering_body` (which department is being questioned) as a prevalence covariate. Do different departments attract questions about systematically different topics?
+
+```{r exercise-3, eval=FALSE}
+
+commons_clean <- commons |>
+  dplyr::filter(!is.na(text), nchar(text) > 20)
+
+proc_commons <- textProcessor(
+  documents = commons_clean$text,
+  metadata  = commons_clean,
+  verbose   = FALSE
+)
+
+out_commons <- prepDocuments(proc_commons$documents,
+                             proc_commons$vocab,
+                             proc_commons$meta,
+                             lower.thresh = 3, verbose = FALSE)
+
+set.seed(02138)
+stm_commons <- stm(
+  documents  = out_commons$documents,
+  vocab      = out_commons$vocab,
+  K          = 8,
+  prevalence = ~ answering_body,
+  data       = out_commons$meta,
+  max.em.its = 50,
+  init.type  = "Spectral",
+  verbose    = FALSE
+)
+
+plot(stm_commons, type = "summary", n = 6)
+```
+
+---
+
+# References and useful articles:
+
+- Bleich, E., & van der Veen, A. M. (2021). Media portrayals of Muslims: a comparative sentiment analysis of American newspapers, 1996–2015. *Politics, Groups, and Identities*, 9(1), 20–39.
+- Burnham, M., Kahn, K., Wang, R. Y., & Peng, R. X. (2025). Political DEBATE: Efficient Zero-Shot and Few-Shot Classifiers for Political Text. Political Analysis, 1–15. doi:10.1017/pan.2025.10028
+- Griswold, M., Robbins, M. W., & Pollard, M. S. (2025). Stay Tuned: Improving Sentiment Analysis and Stance Detection Using Large Language Models. Political Analysis, 1–20. doi:10.1017/pan.2025.10023
+- Hu, M., & Liu, B. (2004). Mining and summarizing customer reviews. *Proceedings of KDD 2004*, 168–177.
+- Devlin, J., Chang, M.-W., Lee, K., & Toutanova, K. (2018). BERT: Pre-training of deep bidirectional transformers for language understanding. *arXiv:1810.04805*.
+- Gilardi, F., Alizadeh, M., & Kubli, M. (2023). ChatGPT outperforms crowd workers for text annotation tasks. *PNAS*, 120(30).
+- Grootendorst, M. (2022). BERTopic: Neural topic modelling with a class-based TF-IDF procedure. *arXiv:2203.05794*.
+- Roberts, M. E., Stewart, B. M., Tingley, D., Lucas, C., Leder-Luis, J., Gadarian, S. K., ... & Rand, D. G. (2014). Structural topic models for open-ended survey responses. *American Journal of Political Science*, 58(4), 1064–1082.
+- Young, L., & Soroka, S. (2012). Affective news: The automated coding of sentiment in political texts. *Political Communication*, 29(2), 205–231.
+
+Special thanks to Zach Dickson (https://z-dickson.github.io/) for the three sample datasets. 
+
+---
+
+```{r session-info, echo=FALSE}
+sessionInfo()
+```
